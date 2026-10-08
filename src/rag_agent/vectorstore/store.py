@@ -81,7 +81,26 @@ class VectorStoreManager:
         #        metadata={"hnsw:space": "cosine"}   # cosine similarity
         #    )
         # 4. Log successful initialisation with collection name and item count
-        raise NotImplementedError
+        import chromadb
+
+        db_path = self._settings.chroma_db_path
+        try:
+            Path(db_path).mkdir(parents=True, exist_ok=True)
+            self._client = chromadb.PersistentClient(path=db_path)
+            self._collection = self._client.get_or_create_collection(
+                name=self._settings.chroma_collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not initialise ChromaDB at {db_path}: {exc}"
+            ) from exc
+
+        logger.info(
+            "ChromaDB ready: collection '{}' with {} items",
+            self._settings.chroma_collection_name,
+            self._collection.count(),
+        )
 
     # -----------------------------------------------------------------------
     # Duplicate Detection
@@ -132,7 +151,8 @@ class VectorStoreManager:
         # TODO: implement
         # self._collection.get(ids=[chunk_id])
         # Return True if the result contains the ID, False otherwise
-        raise NotImplementedError
+        result = self._collection.get(ids=[chunk_id])
+        return chunk_id in result["ids"]
 
     # -----------------------------------------------------------------------
     # Ingestion
@@ -179,7 +199,28 @@ class VectorStoreManager:
         #     )
         #   - result.ingested += 1
         # Log summary and return result
-        raise NotImplementedError
+        result = IngestionResult()
+
+        for chunk in chunks:
+            if self.check_duplicate(chunk.chunk_id):
+                result.skipped += 1
+                continue
+
+            embedding = self._embeddings.embed_documents([chunk.chunk_text])[0]
+            self._collection.upsert(
+                ids=[chunk.chunk_id],
+                embeddings=[embedding],
+                documents=[chunk.chunk_text],
+                metadatas=[chunk.metadata.to_dict()],
+            )
+            result.ingested += 1
+
+        logger.info(
+            "Ingestion complete: {} ingested, {} skipped",
+            result.ingested,
+            result.skipped,
+        )
+        return result
 
     # -----------------------------------------------------------------------
     # Retrieval
@@ -223,19 +264,52 @@ class VectorStoreManager:
         does not know.
         """
         # TODO: implement
-        # k = k or self._settings.retrieval_k
-        # Build where_filter dict from topic_filter and difficulty_filter if provided
-        # Embed query_text using self._embeddings.embed_query(query_text)
-        # self._collection.query(
-        #     query_embeddings=[query_embedding],
-        #     n_results=k,
-        #     where=where_filter,      # None if no filters
-        #     include=["documents", "metadatas", "distances"]
-        # )
-        # Convert distances to similarity scores: score = 1 - distance (for cosine)
-        # Filter out chunks below self._settings.similarity_threshold
-        # Return list of RetrievedChunk objects sorted by score descending
-        raise NotImplementedError
+        k = k or self._settings.retrieval_k
+
+        # Build the metadata filter (None if no filters were given)
+        conditions = []
+        if topic_filter:
+            conditions.append({"topic": topic_filter})
+        if difficulty_filter:
+            conditions.append({"difficulty": difficulty_filter})
+
+        where_filter = None
+        if len(conditions) == 1:
+            where_filter = conditions[0]
+        elif len(conditions) > 1:
+            where_filter = {"$and": conditions}
+
+        query_embedding = self._embeddings.embed_query(query_text)
+        results = self._collection.query(
+            query_embeddings=[query_embedding],
+            n_results=k,
+            where=where_filter,
+            include=["documents", "metadatas", "distances"],
+        )
+
+        retrieved: list[RetrievedChunk] = []
+        ids = results["ids"][0]
+        documents = results["documents"][0]
+        metadatas = results["metadatas"][0]
+        distances = results["distances"][0]
+
+        for chunk_id, text, meta, distance in zip(
+            ids, documents, metadatas, distances
+        ):
+            score = 1 - distance  # cosine distance -> similarity
+            if score < self._settings.similarity_threshold:
+                continue
+            retrieved.append(
+                RetrievedChunk(
+                    chunk_id=chunk_id,
+                    chunk_text=text,
+                    metadata=ChunkMetadata.from_dict(meta),
+                    score=score,
+                )
+            )
+
+        retrieved.sort(key=lambda c: c.score, reverse=True)
+        return retrieved
 
     # -----------------------------------------------------------------------
     # Corpus Inspection

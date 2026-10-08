@@ -21,13 +21,14 @@ PEP 8 | OOP | Single Responsibility
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import streamlit as st
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from rag_agent.agent.graph import get_compiled_graph
 from rag_agent.agent.state import AgentResponse
-from rag_agent.config import get_settings
+from rag_agent.config import LLMFactory, get_settings
 from rag_agent.corpus.chunker import DocumentChunker
 from rag_agent.vectorstore.store import VectorStoreManager
 
@@ -58,9 +59,9 @@ def get_chunker() -> DocumentChunker:
 
 
 @st.cache_resource
-def get_graph():
-    """Return the compiled LangGraph agent."""
-    return get_compiled_graph()
+def get_llm():
+    """Return the cached Groq chat model."""
+    return LLMFactory().create()
 
 
 # ---------------------------------------------------------------------------
@@ -117,27 +118,38 @@ def render_ingestion_panel(
     st.sidebar.header("📂 Corpus Ingestion")
 
     # TODO: implement
-    # 1. st.sidebar.file_uploader(
-    #        "Upload study materials",
-    #        type=["pdf", "md"],
-    #        accept_multiple_files=True
-    #    )
-    #
-    # 2. "Ingest Documents" button — only enabled when files are selected
-    #
-    # 3. On button click:
-    #    a. Save uploaded files to a temp directory
-    #    b. chunker.chunk_files(file_paths)
-    #    c. store.ingest(chunks) → IngestionResult
-    #    d. Display result: st.success / st.warning / st.error
-    #       Show: "{result.ingested} chunks added, {result.skipped} duplicates skipped"
-    #    e. Refresh ingested documents list in session_state
-    #
-    # 4. Render ingested documents list below the uploader
-    #    For each document: show source name, topic, chunk count
-    #    Add a small "🗑 Remove" button per document that calls store.delete_document()
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload study materials",
+        type=["md"],
+        accept_multiple_files=True,
+    )
 
-    st.sidebar.info("Upload .pdf or .md files to populate the corpus.")
+    if st.sidebar.button("Ingest Documents", disabled=not uploaded_files):
+        total_ingested = 0
+        total_skipped = 0
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for uploaded in uploaded_files:
+                # Keep the original filename so topic/difficulty can be inferred
+                tmp_path = Path(tmp_dir) / uploaded.name
+                tmp_path.write_bytes(uploaded.getvalue())
+                try:
+                    chunks = chunker.chunk_file(tmp_path)
+                    result = store.ingest(chunks)
+                    total_ingested += result.ingested
+                    total_skipped += result.skipped
+                except Exception as exc:
+                    st.sidebar.error(f"{uploaded.name}: {exc}")
+
+        message = (
+            f"{total_ingested} chunks added, {total_skipped} duplicates skipped"
+        )
+        if total_ingested > 0:
+            st.sidebar.success(message)
+        else:
+            st.sidebar.warning(message)
+
+    st.sidebar.metric("Chunks in ChromaDB", store._collection.count())
+    st.sidebar.info("Upload .md files to populate the corpus.")
 
 
 def render_corpus_stats(store: VectorStoreManager) -> None:
@@ -204,7 +216,7 @@ def render_document_viewer(store: VectorStoreManager) -> None:
 # ---------------------------------------------------------------------------
 
 
-def render_chat_interface(graph) -> None:
+def render_chat_interface(llm) -> None:
     """
     Render the chat interface in the right column.
 
@@ -244,21 +256,54 @@ def render_chat_interface(graph) -> None:
 
     # Chat input
     # TODO: implement
-    # 1. query = st.chat_input("Ask about a deep learning topic...")
-    #
-    # 2. On submit:
-    #    a. Append user message to chat_history
-    #    b. Display user message immediately (st.rerun or direct render)
-    #    c. Build LangGraph input:
-    #       {"messages": [HumanMessage(content=query)]}
-    #    d. config = {"configurable": {"thread_id": st.session_state.thread_id}}
-    #    e. result = graph.invoke(input, config=config)
-    #    f. response = result["final_response"]
-    #    g. Append assistant message with answer, sources, no_context_found flag
-    #
-    # STRETCH GOAL — streaming:
-    # Replace graph.invoke with graph.stream() and use st.write_stream()
-    # to display tokens as they arrive. Significant "wow factor" in Hour 3.
+        # Chat input
+    query = st.chat_input("Ask about a deep learning topic...")
+    if query:
+        st.session_state.chat_history.append(
+            {"role": "user", "content": query}
+        )
+
+        with st.spinner("Searching your notes..."):
+            chunks = get_vector_store().query(query)
+
+            if not chunks:
+                answer = (
+                    "I couldn't find anything relevant in the ingested notes "
+                    "to answer that."
+                )
+                sources = []
+                no_context = True
+            else:
+                context = "\n\n".join(
+                    f"{c.to_citation()}\n{c.chunk_text}" for c in chunks
+                )
+                messages = [
+                    SystemMessage(
+                        content=(
+                            "You are a study assistant. Answer the question "
+                            "using ONLY the context provided. If the context "
+                            "does not contain the answer, say so."
+                        )
+                    ),
+                    HumanMessage(
+                        content=f"Context:\n{context}\n\nQuestion: {query}"
+                    ),
+                ]
+                answer = llm.invoke(messages).content
+                sources = [
+                    f"{c.to_citation()} (score {c.score:.2f})" for c in chunks
+                ]
+                no_context = False
+
+        st.session_state.chat_history.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "sources": sources,
+                "no_context_found": no_context,
+            }
+        )
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +339,7 @@ def main() -> None:
     # Instantiate shared backend resources
     store = get_vector_store()
     chunker = get_chunker()
-    graph = get_graph()
+    llm = get_llm()
 
     # Sidebar
     render_ingestion_panel(store, chunker)
@@ -307,7 +352,7 @@ def main() -> None:
         render_document_viewer(store)
 
     with chat_col:
-        render_chat_interface(graph)
+        render_chat_interface(llm)
 
 
 if __name__ == "__main__":

@@ -176,7 +176,18 @@ class LLMFactory:
         inference for significantly lower latency than GPU-based inference.
         """
         # TODO: implement using langchain_groq.ChatGroq
-        raise NotImplementedError
+        from langchain_groq import ChatGroq
+
+        if not self._settings.groq_api_key:
+            raise EnvironmentError(
+                "GROQ_API_KEY is missing. Add it to your .env file."
+            )
+
+        return ChatGroq(
+            api_key=self._settings.groq_api_key,
+            model=self._settings.groq_model,
+            temperature=0,
+        )
 
     def _create_ollama(self) -> BaseChatModel:
         """
@@ -266,7 +277,12 @@ class EmbeddingFactory:
         never leaves the machine — important for proprietary datasets.
         """
         # TODO: implement using langchain_community.embeddings.HuggingFaceEmbeddings
-        raise NotImplementedError
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+
+        return HuggingFaceEmbeddings(
+            model_name=self._settings.embedding_model,
+            model_kwargs={"device": "cpu"},
+        )
 
     def _create_openai(self):
         """
